@@ -1,0 +1,52 @@
+#!/bin/bash
+
+[ -f minimal.o ] || { echo "File 'minimal.o' not found."; exit; }
+
+# Change mount namespace for current script.
+# On exit all mountpoints created in this namespace will be torn down.
+[ /proc/$$/ns/mnt -ef /proc/$PPID/ns/mnt ] && exec unshare -m $SHELL $0
+
+# Change pid namespace for current script.
+# This script will become the init process of the new namespace,
+# on termination all children will be killed as well.
+[ /proc/$$/ns/pid -ef /proc/$PPID/ns/pid ] && exec unshare -fp $SHELL $0
+
+# From here on we work in a new mount namespace
+# Exit when any of the following command fails
+set -e
+
+# We mount a new tmpfs for the ip command to store the namespaces into.
+# We made sure that the mount does not propagate to the parent namespace
+# due to the unshare command.
+# The namespace will be destroyed when the script ends, thus unmounting
+# and removing the created network namespace on /run/netns
+mount -t tmpfs none /run/netns
+
+ip netns add h1
+ip netns add h2
+
+# Move the veth peers to different network namespaces
+ip link add h1-eth0 netns h1 type veth peer name h2-eth0 netns h2
+
+ip netns exec h1 ip addr add 10.0.0.1/24 dev h1-eth0
+ip netns exec h1 ip link set dev h1-eth0 up
+
+ip netns exec h2 ip addr add 10.0.0.2/24 dev h2-eth0
+ip netns exec h2 ip link set dev h2-eth0 up
+
+cat <<EOF
+------------            ------------
+|          |            |          |
+| 10.0.0.1 |------------| 10.0.0.2 |
+|          |            |          |
+------------            ------------
+     h1                      h2
+EOF
+
+echo
+ip netns exec h2 tc qdisc add dev h2-eth0 clsact
+ip netns exec h2 tc filter add dev h2-eth0 ingress bpf da obj minimal.o section classifier verbose
+
+echo
+tc exec bpf debug &
+ip netns exec h1 ping -4 10.0.0.2
